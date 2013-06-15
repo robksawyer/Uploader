@@ -11,8 +11,7 @@
 	);
 	Configure::write('Aws', $amazon);
 	$amazon_config_data = Configure::read('Aws');
-	define('CC_S3_URL', $amazon_config_data['url']);
-	define('CC_S3_ACCESS_KEY', $amazon_config_data['key']);
-	define('CC_S3_SECRET_KEY', $amazon_config_data['secret']);
-	debug(CC_S3_SECRET_KEY);
+	define('CC_S3_URL', $amazon_config_data['Aws']['url']);
+	define('CC_S3_ACCESS_KEY', $amazon_config_data['Aws']['key']);
+	define('CC_S3_SECRET_KEY', $amazon_config_data['Aws']['secret']);
 ?>
