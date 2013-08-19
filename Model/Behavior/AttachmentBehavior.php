@@ -17,6 +17,7 @@ use Transit\Transformer\Image\ResizeTransformer;
 use Transit\Transformer\Image\ScaleTransformer;
 use Transit\Transformer\Image\ExifTransformer;
 use Transit\Transformer\Image\RotateTransformer;
+use Transit\Transformer\Image\FitTransformer;
 use Transit\Transporter\Aws\S3Transporter;
 use Transit\Transporter\Aws\GlacierTransporter;
 
@@ -35,6 +36,7 @@ class AttachmentBehavior extends ModelBehavior {
 	const SCALE = 'scale';
 	const ROTATE = 'rotate';
 	const EXIF = 'exif';
+	const FIT = 'fit';
 
 	/**
 	 * Transportation types.
@@ -65,6 +67,7 @@ class AttachmentBehavior extends ModelBehavior {
 	 * 		@type string $prepend		What to prepend to the beginning of the filename
 	 * 		@type string $tempDir		Directory to upload files to temporarily
 	 * 		@type string $uploadDir		Directory to move file to after upload to make it publicly accessible
+	 * 		@type string $transportDir	Directory to place files in after transporting
 	 * 		@type string $finalPath		The final path to prepend to file names (like a domain)
 	 * 		@type string $dbColumn		Database column to write file path to
 	 * 		@type array $metaColumns	Database columns to write meta data to
@@ -83,6 +86,7 @@ class AttachmentBehavior extends ModelBehavior {
 		'prepend' => '',
 		'tempDir' => TMP,
 		'uploadDir' => '',
+		'transportDir' => '',
 		'finalPath' => '',
 		'dbColumn' => '',
 		'metaColumns' => array(),
@@ -104,6 +108,7 @@ class AttachmentBehavior extends ModelBehavior {
 	 * 		@type string $append		What to append to the end of the filename
 	 * 		@type string $prepend		What to prepend to the beginning of the filename
 	 * 		@type string $uploadDir		Directory to move file to after upload to make it publicly accessible
+	 * 		@type string $transportDir	Directory to place files in after transporting
 	 * 		@type string $finalPath		The final path to prepend to file names (like a domain)
 	 * 		@type string $dbColumn		Database column to write file path to
 	 * 		@type string $defaultPath	Default image if no file is uploaded
@@ -117,6 +122,7 @@ class AttachmentBehavior extends ModelBehavior {
 		'append' => '',
 		'prepend' => '',
 		'uploadDir' => '',
+		'transportDir' => '',
 		'finalPath' => '',
 		'dbColumn' => '',
 		'defaultPath' => '',
@@ -209,7 +215,7 @@ class AttachmentBehavior extends ModelBehavior {
 			return false;
 		}
 
-		return $this->deleteFiles($model, $model->id);
+		return $this->deleteFiles($model, $model->id, array(), true);
 	}
 
 	/**
@@ -272,6 +278,7 @@ class AttachmentBehavior extends ModelBehavior {
 				// Successful upload or import
 				if ($response) {
 					$dbColumnMap = array($attachment['dbColumn']);
+					$transportConfig = array($this->_prepareTransport($attachment));
 
 					// Rename and move file
 					$data[$attachment['dbColumn']] = $this->_renameAndMove($model, $transit->getOriginalFile(), $attachment);
@@ -292,6 +299,8 @@ class AttachmentBehavior extends ModelBehavior {
 								$tempFile = $transformedFiles[$count];
 								$dbColumnMap[] = $transform['dbColumn'];
 								$count++;
+
+								$transportConfig[] = $this->_prepareTransport($transform);
 							}
 
 							$data[$transform['dbColumn']] = $this->_renameAndMove($model, $tempFile, $transform);
@@ -302,7 +311,7 @@ class AttachmentBehavior extends ModelBehavior {
 
 					// Transport the files and save their remote path
 					if ($attachment['transport']) {
-						if ($transportedFiles = $transit->transport()) {
+						if ($transportedFiles = $transit->transport($transportConfig)) {
 							foreach ($transportedFiles as $i => $transportedFile) {
 								$data[$dbColumnMap[$i]] = $transportedFile;
 							}
@@ -346,7 +355,7 @@ class AttachmentBehavior extends ModelBehavior {
 
 			// Log exceptions that shouldn't be shown to the client
 			} catch (Exception $e) {
-				$model->invalidate($field, __d('uploader', 'An unknown error has occurred'));
+				$model->invalidate($field, __d('uploader', $e->getMessage()));
 
 				$this->log($e->getMessage(), LOG_DEBUG);
 
@@ -389,9 +398,10 @@ class AttachmentBehavior extends ModelBehavior {
 	 * @param Model $model
 	 * @param int $id
 	 * @param array $filter
+	 * @param bool $isDelete
 	 * @return bool
 	 */
-	public function deleteFiles(Model $model, $id, array $filter = array()) {
+	public function deleteFiles(Model $model, $id, array $filter = array(), $isDelete = false) {
 		$columns = $this->_columns[$model->alias];
 		$data = $model->find('first', array(
 			'conditions' => array($model->alias . '.' . $model->primaryKey => $id),
@@ -409,7 +419,7 @@ class AttachmentBehavior extends ModelBehavior {
 		$save = array();
 
 		foreach ($data[$model->alias] as $column => $value) {
-			if (empty($columns[$column])) {
+			if (empty($columns[$column]) || empty($value)) {
 				continue;
 			} else if ($filter && !in_array($column, $filter)) {
 				continue;
@@ -417,11 +427,16 @@ class AttachmentBehavior extends ModelBehavior {
 
 			if ($this->_deleteFile($model, $columns[$column], $value)) {
 				$save[$column] = '';
+
+				// Reset meta data also
+				foreach ($this->settings[$model->alias][$columns[$column]]['metaColumns'] as $metaKey => $fieldKey) {
+					$save[$fieldKey] = '';
+				}
 			}
 		}
 
 		// Set the fields to empty
-		if ($save) {
+		if ($save && !$isDelete) {
 			$model->id = $id;
 			$model->save($save, array(
 				'validate' => false,
@@ -533,6 +548,7 @@ class AttachmentBehavior extends ModelBehavior {
 	 * @uses Transit\Transformer\Image\ScaleTransformer
 	 * @uses Transit\Transformer\Image\RotateTransformer
 	 * @uses Transit\Transformer\Image\ExifTransformer
+	 * @uses Transit\Transformer\Image\FitTransformer
 	 *
 	 * @param array $options
 	 * @return \Transit\Transformer
@@ -557,6 +573,9 @@ class AttachmentBehavior extends ModelBehavior {
 			break;
 			case self::EXIF:
 				return new ExifTransformer($options);
+			break;
+			case self::FIT:
+				return new FitTransformer($options);
 			break;
 			default:
 				throw new InvalidArgumentException(sprintf('Invalid transformation method %s', $options['method']));
@@ -603,11 +622,11 @@ class AttachmentBehavior extends ModelBehavior {
 			$nameCallback = array($model, $options['nameCallback']);
 		}
 
-		$file->rename($nameCallback, $options['append'], $options['prepend']);
-
 		if ($options['uploadDir']) {
 			$file->move($options['uploadDir'], $options['overwrite']);
 		}
+
+		$file->rename($nameCallback, $options['append'], $options['prepend']);
 
 		return (string) $options['finalPath'] . $file->basename();
 	}
@@ -682,6 +701,26 @@ class AttachmentBehavior extends ModelBehavior {
 				$this->_deleteFile($model, $columns[$column], $previous);
 			}
 		}
+	}
+
+	/**
+	 * Prepare transport configuration.
+	 *
+	 * @param array $settings
+	 * @return array
+	 */
+	protected function _prepareTransport(array $settings) {
+		$config = array();
+
+		if (!empty($settings['transportDir'])) {
+			$config['folder'] = $settings['transportDir'];
+		}
+
+		if (!empty($settings['returnUrl'])) {
+			$config['returnUrl'] = $settings['returnUrl'];
+		}
+
+		return $config;
 	}
 
 }
